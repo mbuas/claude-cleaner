@@ -50,12 +50,12 @@ def _assert_safe(p) -> str:
     return str(rp)
 
 
-def run_cleaner(*args: str, expect_rc=None, timeout=300) -> subprocess.CompletedProcess:
+def run_cleaner(*args: str, expect_rc=None, timeout=300, stdin_text: str = "") -> subprocess.CompletedProcess:
     cmd = [sys.executable, str(SCRIPT), *args]
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env.pop("CLAUDE_CONFIG_DIR", None)  # nigdy nie dziedziczymy zmiennej globalnej
-    cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+    cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", input=stdin_text,
                         errors="replace", env=env, timeout=timeout)
     if expect_rc is not None and cp.returncode != expect_rc:
         raise AssertionError(
@@ -826,6 +826,154 @@ class TestZ_KnownBugs(CleanerTest):
         notes = " ".join(payload["notes"]).lower()
         self.assertTrue(any(w in notes for w in ("uszkodz", "błąd", "blad", "nie udało")),
                         f"brak ostrzeżenia o uszkodzonych plikach JSON; notes={payload['notes']}")
+
+
+# ---------------------------------------------------------------------------
+# k) aplikacja Claude Desktop (claude_desktop_config.json, Claude Extensions)
+# ---------------------------------------------------------------------------
+
+
+DESKTOP_CFG = {
+    "mcpServers": {
+        "gemini-cli": {"command": "npx", "args": ["-y", "gemini-mcp-tool"]},
+        "pal": {"command": "python", "args": ["server.py"]},
+    },
+    "coworkUserFilesPath": "X:\\Claude",
+    "preferences": {"sidebarMode": "epitaxy"},
+}
+
+
+def build_desktop(home: Path) -> tuple:
+    """Dwie kopie danych Claude Desktop jak na Windows (Roaming + MSIX LocalCache)."""
+    roaming = home / "AppData/Roaming/Claude"
+    msix = home / "AppData/Local/Packages/Claude_abc123/LocalCache/Roaming/Claude"
+    _w(roaming / "claude_desktop_config.json", DESKTOP_CFG)
+    _w(roaming / "config.json", {"locale": "pl"})
+    _w(roaming / "Claude Extensions/ant.dir.acme.notes/manifest.json",
+       {"name": "notes", "display_name": "Acme Notes", "version": "1.2.0", "description": "Notatki"})
+    _w(roaming / "Claude Extensions/ant.dir.acme.notes/server/index.js", "//")
+    _w(roaming / "Claude Extensions Settings/ant.dir.acme.notes.json", {"enabled": True})
+    # kopia MSIX: ten sam gemini-cli, brak pal, to samo rozszerzenie
+    _w(msix / "claude_desktop_config.json", {"mcpServers": {"gemini-cli": DESKTOP_CFG["mcpServers"]["gemini-cli"]}})
+    _w(msix / "Claude Extensions/ant.dir.acme.notes/manifest.json", {"name": "notes"})
+    return roaming, msix
+
+
+class TestK_ClaudeDesktop(CleanerTest):
+
+    def setUp(self):
+        super().setUp()
+        self.home, self.proj = self.fixture()
+        self.roaming, self.msix = build_desktop(self.home)
+
+    def test_k01_wykrywa_oba_katalogi_i_laczy_wpisy(self):
+        payload = list_json(self.home)
+        self.assertEqual(len(payload["desktop_dirs"]), 2, payload["desktop_dirs"])
+        gem = one_item(payload, category="Serwery MCP (Claude Desktop)", name="gemini-cli")
+        self.assertEqual(len(gem["actions"]), 2, "gemini-cli powinien mieć wpis z obu plików")
+        self.assertTrue(all(a["kind"] == "json_del" and a["keys"] == ["mcpServers", "gemini-cli"] for a in gem["actions"]))
+        pal = one_item(payload, category="Serwery MCP (Claude Desktop)", name="pal")
+        self.assertEqual(len(pal["actions"]), 1)
+        ext = one_item(payload, category="Rozszerzenia Claude Desktop", name="ant.dir.acme.notes")
+        self.assertIn("Acme Notes", ext["detail"])
+        self.assertIn("v1.2.0", ext["detail"])
+        paths = [a["path"] for a in ext["actions"]]
+        self.assertEqual(len(paths), 3, paths)  # 2 katalogi + plik ustawień
+        self.assertTrue(any(p.endswith("ant.dir.acme.notes.json") for p in paths))
+        # pliki rdzenia aplikacji nie są na liście
+        self.assertFalse(find_item(payload, name_contains="config.json"))
+
+    def test_k02_usuniecie_mcp_z_obu_plikow_zostawia_reszte(self):
+        payload = list_json(self.home)
+        gem = one_item(payload, category="Serwery MCP (Claude Desktop)", name="gemini-cli")
+        bk = self.backup_dir()
+        run_cleaner("--home", _assert_safe(self.home), "--no-projects", "--select", str(gem["index"]),
+                    "--yes", "--no-color", "--backup-dir", _assert_safe(bk), expect_rc=0)
+        r = json.loads((self.roaming / "claude_desktop_config.json").read_text(encoding="utf-8"))
+        m = json.loads((self.msix / "claude_desktop_config.json").read_text(encoding="utf-8"))
+        self.assertNotIn("gemini-cli", r["mcpServers"])
+        self.assertIn("pal", r["mcpServers"])
+        self.assertEqual(r["preferences"], {"sidebarMode": "epitaxy"})
+        self.assertEqual(r["coworkUserFilesPath"], "X:\\Claude")
+        self.assertEqual(m["mcpServers"], {})
+        self.assertTrue((self.msix / "claude_desktop_config.json").exists(), "plik konfiguracyjny nie może zniknąć")
+        mf = json.loads((bk / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(mf["desktop_dirs"]), 2)
+        self.assertEqual(len(mf["json_backups"]), 2)
+        run_cleaner("--restore", _assert_safe(bk), "--no-color", expect_rc=0)
+        r2 = json.loads((self.roaming / "claude_desktop_config.json").read_text(encoding="utf-8"))
+        self.assertIn("gemini-cli", r2["mcpServers"])
+
+    def test_k03_usuniecie_rozszerzenia(self):
+        payload = list_json(self.home)
+        ext = one_item(payload, category="Rozszerzenia Claude Desktop", name="ant.dir.acme.notes")
+        bk = self.backup_dir()
+        run_cleaner("--home", _assert_safe(self.home), "--no-projects", "--select", str(ext["index"]),
+                    "--yes", "--no-color", "--backup-dir", _assert_safe(bk), expect_rc=0)
+        self.assertFalse((self.roaming / "Claude Extensions/ant.dir.acme.notes").exists())
+        self.assertFalse((self.msix / "Claude Extensions/ant.dir.acme.notes").exists())
+        self.assertFalse((self.roaming / "Claude Extensions Settings/ant.dir.acme.notes.json").exists())
+        self.assertTrue((self.roaming / "Claude Extensions").is_dir())
+        self.assertTrue((self.roaming / "config.json").exists())
+        run_cleaner("--restore", _assert_safe(bk), "--no-color", expect_rc=0)
+        self.assertTrue((self.roaming / "Claude Extensions/ant.dir.acme.notes/manifest.json").exists())
+
+    def test_k04_guard_nie_usunie_katalogu_desktop(self):
+        cp = run_cleaner("--home", _assert_safe(self.home), "--no-projects", "--select", "all", "--yes", "--no-color",
+                         "--backup-dir", _assert_safe(self.backup_dir()))
+        self.assertIn(cp.returncode, (0, 1))
+        self.assertTrue(self.roaming.is_dir())
+        self.assertTrue(self.msix.is_dir())
+        self.assertTrue((self.roaming / "config.json").exists())
+
+    def test_k05_desktop_bez_claude_code(self):
+        home = self.root / "only-desktop"
+        build_desktop(home)
+        payload = list_json(home)
+        self.assertTrue(find_item(payload, category="Serwery MCP (Claude Desktop)", name="pal"))
+        self.assertTrue(any("Nie znaleziono katalogu Claude Code" in n for n in payload["notes"]))
+
+
+# ---------------------------------------------------------------------------
+# l) potwierdzenie: dwa razy Enter
+# ---------------------------------------------------------------------------
+
+
+class TestL_DoubleEnter(CleanerTest):
+
+    def _prep(self):
+        home, proj = self.fixture()
+        payload = list_json(home)
+        it = one_item(payload, category="Serwery MCP (globalne)", name="pal")
+        return home, it
+
+    def _run(self, home, it, stdin_text):
+        return run_cleaner("--home", _assert_safe(home), "--no-projects", "--select", str(it["index"]),
+                           "--no-color", "--backup-dir", _assert_safe(self.backup_dir()), stdin_text=stdin_text)
+
+    def test_l01_dwa_entery_potwierdzaja(self):
+        home, it = self._prep()
+        cp = self._run(home, it, "\n\n")
+        self.assertEqual(cp.returncode, 0, cp.stdout + cp.stderr)
+        self.assertIn("Wykonano", cp.stdout)
+        cj = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
+        self.assertNotIn("pal", cj.get("mcpServers", {}))
+
+    def test_l02_jeden_enter_anuluje(self):
+        home, it = self._prep()
+        cp = self._run(home, it, "\n")
+        self.assertEqual(cp.returncode, 0)
+        self.assertIn("Anulowano", cp.stdout)
+        cj = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
+        self.assertIn("pal", cj["mcpServers"])
+
+    def test_l03_tak_juz_nie_potwierdza(self):
+        home, it = self._prep()
+        for text in ("tak\n", "tak\n\n", "\nx\n", "y\n\n"):
+            cp = self._run(home, it, text)
+            self.assertIn("Anulowano", cp.stdout, repr(text))
+        cj = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
+        self.assertIn("pal", cj["mcpServers"])
 
 
 if __name__ == "__main__":

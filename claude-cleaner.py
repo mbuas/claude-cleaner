@@ -6,8 +6,10 @@ claude-cleaner — przenośny porządkowacz rozszerzeń Claude Code.
 Wykrywa wszystko, co zostało dołożone do Claude Code (pluginy, marketplace'y,
 serwery MCP, skills, komendy, agentów, hooki, style, status line, znane
 frameworki typu GSD / gstack / SuperClaude / BMAD / spec-kit / claude-flow
-oraz nieznane katalogi), skanuje folder z projektami i pozwala wybrać,
-co usunąć. Nic nie jest kasowane bezpowrotnie: pliki lądują w kopii
+oraz nieznane katalogi), a także serwery MCP i rozszerzenia aplikacji
+Claude Desktop (%APPDATA%\\Claude, kopia MSIX w Packages\\Claude_*\\LocalCache,
+~/Library/Application Support/Claude, ~/.config/Claude), skanuje folder
+z projektami i pozwala wybrać, co usunąć. Potwierdzenie: Enter dwa razy. Nic nie jest kasowane bezpowrotnie: pliki lądują w kopii
 zapasowej z manifestem, a edytowane pliki JSON są wcześniej kopiowane.
 
 Wymagania: Python 3.8+ (tylko biblioteka standardowa). Windows / macOS / Linux.
@@ -222,12 +224,19 @@ class Env:
     claude_dir: Path
     claude_json: Path
     claude_bin: str = ""
+    desktop_dirs: List[Path] = field(default_factory=list)   # dane aplikacji Claude Desktop
 
     def rel(self, p: Path) -> str:
         try:
             return "~/.claude/" + p.relative_to(self.claude_dir).as_posix()
         except ValueError:
             pass
+        for i, d in enumerate(self.desktop_dirs):
+            try:
+                tag = "Claude Desktop" + (f"#{i + 1}" if len(self.desktop_dirs) > 1 else "")
+                return f"[{tag}]/" + p.relative_to(d).as_posix()
+            except ValueError:
+                pass
         try:
             return "~/" + p.relative_to(self.user_home).as_posix()
         except ValueError:
@@ -252,7 +261,43 @@ def find_env(home_override: Optional[str]) -> Env:
         else:
             claude_dir = user_home / ".claude"
             claude_json = user_home / ".claude.json"
-    return Env(user_home, claude_dir, claude_json, shutil.which("claude") or "")
+    return Env(user_home, claude_dir, claude_json, shutil.which("claude") or "",
+               find_desktop_dirs(user_home, use_env=not home_override))
+
+
+def find_desktop_dirs(user_home: Path, use_env: bool) -> List[Path]:
+    """Katalogi danych aplikacji Claude Desktop (osobnej od Claude Code).
+
+    Windows: %APPDATA%\\Claude oraz kopia MSIX
+             %LOCALAPPDATA%\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude
+    macOS:   ~/Library/Application Support/Claude
+    Linux:   ~/.config/Claude
+    Przy --home wszystko jest szukane względem wskazanego katalogu (testy).
+    """
+    cands: List[Path] = []
+    if use_env and os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            cands.append(Path(appdata) / "Claude")
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            cands.extend(sorted((Path(local) / "Packages").glob("Claude_*/LocalCache/Roaming/Claude")))
+    cands.append(user_home / "AppData" / "Roaming" / "Claude")
+    cands.extend(sorted((user_home / "AppData" / "Local" / "Packages").glob("Claude_*/LocalCache/Roaming/Claude")))
+    cands.append(user_home / "Library" / "Application Support" / "Claude")
+    cands.append(user_home / ".config" / "Claude")
+    out: List[Path] = []
+    for c in cands:
+        try:
+            if not c.is_dir():
+                continue
+            # ten sam katalog pod dwiema nazwami (dowiązanie / przekierowanie) liczy się raz
+            if any(os.path.samefile(str(c), str(o)) for o in out):
+                continue
+        except OSError:
+            continue
+        out.append(c)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +474,9 @@ CORE_ENTRIES = {
     "routines", "artifacts", "code_reviews", "auto-mode", "remote", "web-sessions",
 }
 
+CAT_DESKTOP_MCP = "Serwery MCP (Claude Desktop)"
+CAT_DESKTOP_EXT = "Rozszerzenia Claude Desktop"
+
 # Katalogi rozszerzeń zarządzane pozycja po pozycji.
 EXT_DIRS = {
     "skills": "Skills",
@@ -512,16 +560,79 @@ class Detector:
     # --- globalne ---
     def run_global(self) -> None:
         env = self.env
-        if not env.claude_dir.is_dir() and not env.claude_json.exists():
+        if env.claude_dir.is_dir() or env.claude_json.exists():
+            self.detect_plugins()
+            self.detect_marketplaces()
+            self.detect_mcp_global()
+            self.detect_ext_dirs()
+            self.detect_settings_bits()
+            self.detect_unknown_entries()
+            self.detect_home_companions()
+        else:
             self.notes.append("Nie znaleziono katalogu Claude Code (~/.claude ani ~/.claude.json).")
-            return
-        self.detect_plugins()
-        self.detect_marketplaces()
-        self.detect_mcp_global()
-        self.detect_ext_dirs()
-        self.detect_settings_bits()
-        self.detect_unknown_entries()
-        self.detect_home_companions()
+        self.detect_desktop_app()
+
+    # --- aplikacja Claude Desktop ---
+    def detect_desktop_app(self) -> None:
+        """Serwery MCP z claude_desktop_config.json i katalog 'Claude Extensions' aplikacji Claude Desktop.
+
+        Na Windows te same dane bywają w dwóch miejscach (%APPDATA%\\Claude i kopia MSIX w
+        Packages\\Claude_*\\LocalCache\\Roaming\\Claude) — taki sam wpis jest łączony w jeden element,
+        którego usunięcie czyści oba pliki."""
+        env = self.env
+        mcp_items: Dict[str, Item] = {}
+        ext_items: Dict[str, Item] = {}
+        for d in env.desktop_dirs:
+            cfg_f = d / "claude_desktop_config.json"
+            cfg = load_json(cfg_f) or {}
+            mcps = cfg.get("mcpServers", {}) if isinstance(cfg.get("mcpServers"), dict) else {}
+            for name, scfg in mcps.items():
+                item = mcp_items.get(name)
+                if item is None:
+                    item = mcp_items[name] = self.add(Item(CAT_DESKTOP_MCP, name, tool=self.match_framework(name)))
+                    item.detail = self._mcp_desc(scfg)
+                item.actions.append(Action("json_del", cfg_f, ["mcpServers", name]))
+                item.parts.append(f"wpis mcpServers w {env.rel(cfg_f)}")
+            ext_dir = d / "Claude Extensions"
+            if not ext_dir.is_dir():
+                continue
+            try:
+                entries = sorted(ext_dir.iterdir(), key=lambda p: p.name.lower())
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.name.startswith(".") or entry.name.endswith((".lock", ".log", ".tmp")):
+                    continue
+                key = entry.name.lower()
+                item = ext_items.get(key)
+                if item is None:
+                    item = ext_items[key] = self.add(Item(CAT_DESKTOP_EXT, entry.name, tool=self.match_framework(entry.name)))
+                    item.detail = self._desktop_ext_desc(entry)
+                item.actions.append(Action("rm_path", entry))
+                item.parts.append(env.rel(entry))
+                # ustawienia rozszerzenia (jeśli aplikacja trzyma je obok, plik o tej samej nazwie)
+                sdir = d / "Claude Extensions Settings"
+                if sdir.is_dir():
+                    for sf in sorted(sdir.glob(entry.name + ".*")):
+                        if sf.is_file():
+                            item.actions.append(Action("rm_path", sf))
+                            item.parts.append(env.rel(sf))
+
+    @staticmethod
+    def _desktop_ext_desc(entry: Path) -> str:
+        if not entry.is_dir():
+            return f"plik, {human(dir_size(entry))}"
+        m = load_json(entry / "manifest.json") or {}
+        bits = []
+        disp = m.get("display_name") or m.get("name")
+        if disp and str(disp) != entry.name:
+            bits.append(str(disp))
+        if m.get("version"):
+            bits.append(f"v{m['version']}")
+        if m.get("description"):
+            bits.append(short(str(m["description"]).strip().splitlines()[0], 60))
+        bits.append(human(dir_size(entry)))
+        return " · ".join(bits)
 
     def detect_plugins(self) -> None:
         env = self.env
@@ -1039,7 +1150,8 @@ class Detector:
         self.group_frameworks()
         order = [
             "Wykryte narzędzia (pakiety)", "Pluginy", "Marketplace'y pluginów", "Serwery MCP (globalne)",
-            "Serwery MCP (zakres projektu w ~/.claude.json)", "Skills", "Komendy (slash)", "Agenci",
+            "Serwery MCP (zakres projektu w ~/.claude.json)", CAT_DESKTOP_MCP, CAT_DESKTOP_EXT,
+            "Skills", "Komendy (slash)", "Agenci",
             "Hooki (settings)", "Hooki (pliki)", "Style odpowiedzi", "Status line / inne ustawienia",
             "Nieznane elementy w ~/.claude", "Katalogi narzędzi w katalogu domowym",
         ]
@@ -1075,6 +1187,7 @@ class Executor:
         self.manifest: dict = {
             "version": VERSION, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
             "claude_dir": str(env.claude_dir), "claude_json": str(env.claude_json),
+            "desktop_dirs": [str(d) for d in env.desktop_dirs],
             "moves": [], "json_backups": [], "json_edits": [],
         }
         self._json_backed: Dict[str, str] = {}
@@ -1099,9 +1212,9 @@ class Executor:
         self.manifest["json_backups"].append({"original": key, "backup": str(dst)})
 
     def _guard(self, p: Path) -> None:
-        """Nigdy nie usuwaj katalogu domowego ani samego ~/.claude / ~/.claude.json."""
+        """Nigdy nie usuwaj katalogu domowego, samego ~/.claude / ~/.claude.json ani katalogu danych Claude Desktop."""
         rp = Path(os.path.abspath(str(p)))
-        forbidden = {Path(os.path.abspath(str(x))) for x in (self.env.user_home, self.env.claude_dir, self.env.claude_json, Path.home())}
+        forbidden = {Path(os.path.abspath(str(x))) for x in (self.env.user_home, self.env.claude_dir, self.env.claude_json, Path.home(), *self.env.desktop_dirs)}
         if rp in forbidden or rp.parent == rp:
             raise RuntimeError(f"Odmowa: {p} jest chronioną ścieżką.")
         for prot in forbidden:
@@ -1253,6 +1366,11 @@ def banner(env: Env) -> None:
     print(col(C.GRAY, "  katalog    ") + f"{env.claude_dir} " + (col(C.GREEN, ok) if ok == "✓" else col(C.RED, ok)))
     ok2 = "✓" if env.claude_json.exists() else "✗"
     print(col(C.GRAY, "  config     ") + f"{env.claude_json} " + (col(C.GREEN, ok2) if ok2 == "✓" else col(C.RED, ok2)))
+    if env.desktop_dirs:
+        for d in env.desktop_dirs:
+            print(col(C.GRAY, "  desktop    ") + f"{d} " + col(C.GREEN, "✓"))
+    else:
+        print(col(C.GRAY, "  desktop    ") + col(C.GRAY, "aplikacja Claude Desktop nie znaleziona (pomijam)"))
     print()
 
 
@@ -1539,11 +1657,37 @@ def confirm(chosen: List[Item], backup_root: Path, dry_run: bool, yes: bool) -> 
     print()
     print("  Pliki zostaną " + col(C.BOLD, "przeniesione") + " do folderu kopii (nie kasowane), a pliki JSON zmodyfikowane po zrobieniu kopii.")
     print("  Cofnięcie: " + col(C.ACCENT, f"python {Path(sys.argv[0]).name} --restore \"{backup_root}\""))
+    return wait_double_enter()
+
+
+def wait_double_enter() -> bool:
+    """Potwierdzenie: Enter naciśnięty dwa razy pod rząd. Każdy inny klawisz anuluje.
+
+    Bez terminala (potok, testy) czyta dwie linie ze stdin — obie muszą być puste."""
+    prompt = col(C.ACCENT, "  Kontynuować? ") + col(C.GRAY, "naciśnij Enter dwa razy, dowolny inny klawisz anuluje ") + "› "
+    if is_tty():
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        try:
+            if read_key() != "enter":
+                print(col(C.GRAY, "anulowano"))
+                return False
+            sys.stdout.write(col(C.GREEN, "↵ ") + col(C.GRAY, "jeszcze raz Enter… "))
+            sys.stdout.flush()
+            if read_key() != "enter":
+                print(col(C.GRAY, "anulowano"))
+                return False
+            print(col(C.GREEN, "↵"))
+            return True
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
     try:
-        ans = input(col(C.ACCENT, "  Kontynuować? ") + col(C.GRAY, "[tak/N] ") + "› ").strip().lower()
+        if input(prompt).strip():
+            return False
+        return not input(col(C.GRAY, "  jeszcze raz Enter › ")).strip()
     except (EOFError, KeyboardInterrupt):
         return False
-    return ans in ("tak", "t", "y", "yes")
 
 
 def run_actions(chosen: List[Item], ex: Executor) -> Tuple[int, int]:
@@ -1636,7 +1780,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "index": it.index, "category": it.category, "name": it.name, "detail": it.detail, "tool": it.tool,
             "parts": it.parts, "actions": [{"kind": a.kind, "path": str(a.path), "keys": a.keys, "value": a.value} for a in it.actions],
         } for it in det.items]
-        print(json.dumps({"claude_dir": str(env.claude_dir), "claude_json": str(env.claude_json), "notes": det.notes, "items": payload}, ensure_ascii=False, indent=2))
+        print(json.dumps({"claude_dir": str(env.claude_dir), "claude_json": str(env.claude_json),
+                          "desktop_dirs": [str(d) for d in env.desktop_dirs], "notes": det.notes, "items": payload},
+                         ensure_ascii=False, indent=2))
         return 0
 
     print()

@@ -16,9 +16,10 @@ Wszystko, co zostało dołożone do Claude Code, niezależnie od tego, jak się 
 | Znane frameworki | GSD, gstack, SuperClaude, BMAD, spec-kit, CCPM, claude-flow, Serena, Agent OS, Task Master, OMC, claude-mem, Conductor. Ich części są grupowane w jeden „pakiet”, który usuwa się jednym zaznaczeniem |
 | Nieznane elementy | każdy katalog/plik w `~/.claude`, który nie należy do samego Claude Code |
 | Katalogi narzędzi w `$HOME` | np. `~/.gstack`, `~/.omc`, `~/.claude-flow` |
+| Aplikacja Claude Desktop | serwery MCP z `claude_desktop_config.json` i katalog `Claude Extensions` — Windows: `%APPDATA%\Claude` **oraz** kopia MSIX `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude` (ten sam wpis w obu miejscach to jeden element na liście), macOS: `~/Library/Application Support/Claude`, Linux: `~/.config/Claude` |
 | Projekty | `.claude/` (commands, agents, skills, hooks, settings), `.mcp.json`, `CLAUDE.md`, `CLAUDE.local.md`, `.planning`, `.gstack`, `.specify`, `.bmad*`, `.serena` itd. |
 
-Lokalizacja Claude Code jest wykrywana automatycznie (`CLAUDE_CONFIG_DIR` lub `~/.claude`). Nic nie trzeba wskazywać.
+Lokalizacja Claude Code jest wykrywana automatycznie (`CLAUDE_CONFIG_DIR` lub `~/.claude`), podobnie jak katalogi danych aplikacji Claude Desktop. Nic nie trzeba wskazywać.
 
 ## Instalacja
 
@@ -42,14 +43,14 @@ python claude-cleaner.py
 1. Skrypt skanuje konfigurację globalną.
 2. Pyta o folder z projektami: **Enter** otwiera okno wyboru folderu, **w** pozwala wpisać ścieżkę, **s** pomija.
 3. Pokazuje listę z checkboxami: **↑/↓** nawigacja, **spacja** zaznacz, **a** cała kategoria, **A** wszystko, **i** odwróć, **Enter** dalej, **q** wyjście.
-4. Wyświetla podsumowanie operacji i prosi o potwierdzenie (`tak`).
+4. Wyświetla podsumowanie operacji i prosi o potwierdzenie: **Enter naciśnięty dwa razy**. Dowolny inny klawisz anuluje. (Bez terminala, np. w potoku, czyta dwie puste linie ze stdin.)
 
 ## Bezpieczeństwo
 
 - Pliki nie są kasowane. Są **przenoszone** do `~/.claude-cleaner-backups/<data>/` razem z `manifest.json`.
 - Pliki JSON są kopiowane do tego samego folderu przed edycją.
 - Cofnięcie: `python claude-cleaner.py --restore ~/.claude-cleaner-backups/<data>`
-- Skrypt nigdy nie przeniesie samego `~/.claude`, `~/.claude.json`, katalogu domowego ani żadnego katalogu nadrzędnego wobec nich.
+- Skrypt nigdy nie przeniesie samego `~/.claude`, `~/.claude.json`, katalogu danych Claude Desktop, katalogu domowego ani żadnego katalogu nadrzędnego wobec nich.
 - Jeśli któraś operacja elementu się nie powiedzie, pozostałe operacje tego elementu są pomijane, żeby nie zostawić niespójnego stanu.
 - Uszkodzone pliki JSON są pomijane i wyraźnie zgłaszane na liście jako nieprzeanalizowane.
 - Kopia z innego komputera przy `--restore` wywołuje ostrzeżenie i pytanie o potwierdzenie.
